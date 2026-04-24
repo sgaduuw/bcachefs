@@ -90,7 +90,8 @@ struct bch_extent_rebalance_v1 {
 struct bch_extent_reconcile {
 #if defined(__LITTLE_ENDIAN_BITFIELD)
 	__u64	type:8,
-		unused:2,
+		unused:1,
+		need_restripe:1,
 		ptrs_moving:5,
 		hipri:1,
 		pending:1,
@@ -128,7 +129,8 @@ struct bch_extent_reconcile {
 		pending:1,
 		hipri:1,
 		ptrs_moving:5,
-		unused:2,
+		need_restripe:1,
+		unused:1,
 		type:8;
 #endif
 };
@@ -156,8 +158,6 @@ enum bch_reconcile_opts {
 #define x(n)	BCH_RECONCILE_##n,
 	BCH_RECONCILE_OPTS()
 #undef x
-	/* Not an inode opt; standalone need_rb flag for narrow EC stripes */
-	BCH_RECONCILE_stripe_width,
 };
 
 #define BCH_RECONCILE_ACCOUNTING()		\

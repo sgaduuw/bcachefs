@@ -51,7 +51,6 @@ enum reconcile_phase_type {
 
 const char * const bch2_reconcile_opts[] = {
 	BCH_RECONCILE_OPTS()
-	[BCH_RECONCILE_stripe_width] = "stripe_width",
 	NULL
 };
 
@@ -416,7 +415,7 @@ static int reconcile_set_data_opts(struct btree_trans *trans,
 		}
 	}
 
-	if (r->need_rb & BIT(BCH_RECONCILE_stripe_width)) {
+	if (r->need_restripe) {
 		/*
 		 * Extent lives in a narrow EC stripe; drop the EC encoding
 		 * so data gets rewritten to new buckets and re-encoded into

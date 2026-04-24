@@ -128,6 +128,8 @@ void bch2_extent_reconcile_to_text(struct printbuf *out, struct bch_fs *c,
 	prt_str(out, "need_rb=");
 	prt_bitflags(out, bch2_reconcile_opts, r->need_rb);
 
+	if (r->need_restripe)
+		prt_str(out, " need_restripe");
 	if (r->hipri)
 		prt_str(out, " hipri");
 	if (r->pending)
@@ -450,7 +452,7 @@ static inline bool bkey_should_have_rb_opts(struct bkey_s_c k,
 		BCH_RECONCILE_OPTS()
 #undef x
 	}
-	return new.need_rb;
+	return new.need_rb || new.need_restripe;
 }
 
 static int bch2_bkey_needs_reconcile(struct btree_trans *trans, struct bkey_s_c k,
@@ -483,7 +485,8 @@ static int bch2_bkey_needs_reconcile(struct btree_trans *trans, struct bkey_s_c 
 	bool incompressible = false, unwritten = false, ec = false;
 	unsigned durability = 0, durability_acct = 0, invalid = 0, min_durability = INT_MAX;
 	unsigned ec_redundancy = 0;
-	u64 ec_stripe_idx = 0;
+	unsigned nr_ec_stripes = 0;
+	u64 ec_stripe_idxs[BCH_BKEY_PTRS_MAX];
 
 	const union bch_extent_entry *entry;
 	struct extent_ptr_decoded p;
@@ -537,8 +540,8 @@ static int bch2_bkey_needs_reconcile(struct btree_trans *trans, struct bkey_s_c 
 
 		if (p.has_ec && r.erasure_code)
 			ec_redundancy = max_t(unsigned, ec_redundancy, p.ec.redundancy);
-		if (p.has_ec && !ec)
-			ec_stripe_idx = p.ec.idx;
+		if (p.has_ec)
+			ec_stripe_idxs[nr_ec_stripes++] = p.ec.idx;
 		ec |= p.has_ec;
 
 		invalid += p.ptr.dev == BCH_SB_MEMBER_INVALID;
@@ -576,30 +579,33 @@ static int bch2_bkey_needs_reconcile(struct btree_trans *trans, struct bkey_s_c 
 	 * flag it for reconcile to rewrite into a wider stripe.
 	 *
 	 * Only check when EC is present and desired (no erasure_code
-	 * mismatch), and skip unwritten extents.
+	 * mismatch), and skip unwritten extents. Checks all stripe_ptrs
+	 * since an extent could have replicas in different stripes.
 	 */
 	if (ec && !unwritten && !(r.need_rb & BIT(BCH_RECONCILE_erasure_code))) {
-		CLASS(btree_iter, s_iter)(trans, BTREE_ID_stripes,
-					 POS(0, ec_stripe_idx), 0);
-		struct bkey_s_c s_k =
-			bkey_try(bch2_btree_iter_peek_slot(&s_iter));
+		for (unsigned i = 0; i < nr_ec_stripes && !r.need_restripe; i++) {
+			CLASS(btree_iter, s_iter)(trans, BTREE_ID_stripes,
+						 POS(0, ec_stripe_idxs[i]), 0);
+			struct bkey_s_c s_k =
+				bkey_try(bch2_btree_iter_peek_slot(&s_iter));
 
-		if (s_k.k->type == KEY_TYPE_stripe) {
-			const struct bch_stripe *s = bkey_s_c_to_stripe(s_k).v;
-			unsigned nr_data = s->nr_blocks - s->nr_redundant;
+			if (s_k.k->type == KEY_TYPE_stripe) {
+				const struct bch_stripe *s = bkey_s_c_to_stripe(s_k).v;
+				unsigned nr_data = s->nr_blocks - s->nr_redundant;
 
-			struct bch_devs_mask devs;
-			disk_label_ec_devs(c, s->disk_label, &devs,
-					   le16_to_cpu(s->sectors));
-			unsigned nr_devs = dev_mask_nr(&devs);
+				struct bch_devs_mask devs;
+				disk_label_ec_devs(c, s->disk_label, &devs,
+						   le16_to_cpu(s->sectors));
+				unsigned nr_devs = dev_mask_nr(&devs);
 
-			if (nr_devs >= s->nr_redundant + 2) {
-				unsigned target_nr_data =
-					min_t(unsigned, nr_devs,
-					      BCH_BKEY_PTRS_MAX) - s->nr_redundant;
+				if (nr_devs >= s->nr_redundant + 2) {
+					unsigned target_nr_data =
+						min_t(unsigned, nr_devs,
+						      BCH_BKEY_PTRS_MAX) - s->nr_redundant;
 
-				if (nr_data < target_nr_data)
-					r.need_rb |= BIT(BCH_RECONCILE_stripe_width);
+					if (nr_data < target_nr_data)
+						r.need_restripe = 1;
+				}
 			}
 		}
 	}
@@ -729,8 +735,7 @@ static int new_needs_rb_allowed(struct btree_trans *trans,
 
 	if (ctx == SET_NEEDS_RECONCILE_foreground) {
 		new_need_rb &= ~(BIT(BCH_RECONCILE_background_compression)|
-				 BIT(BCH_RECONCILE_background_target)|
-				 BIT(BCH_RECONCILE_stripe_width));
+				 BIT(BCH_RECONCILE_background_target));
 
 		/*
 		 * Foreground writes might end up degraded when a device is
