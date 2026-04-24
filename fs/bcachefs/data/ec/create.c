@@ -779,9 +779,9 @@ static unsigned pick_blocksize(struct bch_fs *c,
 }
 
 /* returns blocksize */
-static unsigned disk_label_ec_devs(struct bch_fs *c, unsigned disk_label,
-				   struct bch_devs_mask *devs,
-				   unsigned blocksize)
+unsigned disk_label_ec_devs(struct bch_fs *c, unsigned disk_label,
+			    struct bch_devs_mask *devs,
+			    unsigned blocksize)
 {
 	guard(rcu)();
 

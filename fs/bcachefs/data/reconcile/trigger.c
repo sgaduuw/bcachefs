@@ -10,6 +10,8 @@
 
 #include "data/checksum.h"
 #include "data/compress.h"
+#include "data/ec/create.h"
+#include "data/ec/format.h"
 #include "data/extents.h"
 #include "data/reconcile/trigger.h"
 #include "data/reconcile/work.h"
@@ -481,6 +483,7 @@ static int bch2_bkey_needs_reconcile(struct btree_trans *trans, struct bkey_s_c 
 	bool incompressible = false, unwritten = false, ec = false;
 	unsigned durability = 0, durability_acct = 0, invalid = 0, min_durability = INT_MAX;
 	unsigned ec_redundancy = 0;
+	u64 ec_stripe_idx = 0;
 
 	const union bch_extent_entry *entry;
 	struct extent_ptr_decoded p;
@@ -534,6 +537,8 @@ static int bch2_bkey_needs_reconcile(struct btree_trans *trans, struct bkey_s_c 
 
 		if (p.has_ec && r.erasure_code)
 			ec_redundancy = max_t(unsigned, ec_redundancy, p.ec.redundancy);
+		if (p.has_ec && !ec)
+			ec_stripe_idx = p.ec.idx;
 		ec |= p.has_ec;
 
 		invalid += p.ptr.dev == BCH_SB_MEMBER_INVALID;
@@ -564,6 +569,40 @@ static int bch2_bkey_needs_reconcile(struct btree_trans *trans, struct bkey_s_c 
 
 	if (!unwritten && r.erasure_code != ec)
 		r.need_rb |= BIT(BCH_RECONCILE_erasure_code);
+
+	/*
+	 * Narrow EC stripe detection: if the extent is in an EC stripe
+	 * with fewer data blocks than the current target geometry allows,
+	 * flag it for reconcile to rewrite into a wider stripe.
+	 *
+	 * Only check when EC is present and desired (no erasure_code
+	 * mismatch), and skip unwritten extents.
+	 */
+	if (ec && !unwritten && !(r.need_rb & BIT(BCH_RECONCILE_erasure_code))) {
+		CLASS(btree_iter, s_iter)(trans, BTREE_ID_stripes,
+					 POS(0, ec_stripe_idx), 0);
+		struct bkey_s_c s_k =
+			bkey_try(bch2_btree_iter_peek_slot(&s_iter));
+
+		if (s_k.k->type == KEY_TYPE_stripe) {
+			const struct bch_stripe *s = bkey_s_c_to_stripe(s_k).v;
+			unsigned nr_data = s->nr_blocks - s->nr_redundant;
+
+			struct bch_devs_mask devs;
+			disk_label_ec_devs(c, s->disk_label, &devs,
+					   le16_to_cpu(s->sectors));
+			unsigned nr_devs = dev_mask_nr(&devs);
+
+			if (nr_devs >= s->nr_redundant + 2) {
+				unsigned target_nr_data =
+					min_t(unsigned, nr_devs,
+					      BCH_BKEY_PTRS_MAX) - s->nr_redundant;
+
+				if (nr_data < target_nr_data)
+					r.need_rb |= BIT(BCH_RECONCILE_stripe_width);
+			}
+		}
+	}
 
 	*need_update_invalid_devs =
 		min_t(int, durability_acct + invalid - r.data_replicas, invalid);
