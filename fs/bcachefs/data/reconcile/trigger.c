@@ -604,8 +604,14 @@ static int bch2_bkey_needs_reconcile(struct btree_trans *trans, struct bkey_s_c 
 						min_t(unsigned, nr_devs,
 						      BCH_BKEY_PTRS_MAX) - s->nr_redundant;
 
-					if (nr_data < target_nr_data)
+					if (nr_data < target_nr_data) {
+						bch_info_ratelimited(c,
+							"reconcile: narrow stripe %llu (%u+%u, target %u+%u), queuing restripe",
+							ec_stripe_idxs[i],
+							nr_data, s->nr_redundant,
+							target_nr_data, s->nr_redundant);
 						r.need_restripe = 1;
+					}
 				}
 			}
 		}
