@@ -745,6 +745,16 @@ static int do_reconcile_extent(struct moving_context *ctxt,
 				  work, &iter, 0,
 				  bkey_i_to_s_c(stack_k.k), stripe_retry));
 
+	{
+		const struct bch_extent_reconcile *r =
+			bch2_bkey_reconcile_opts(c, bkey_i_to_s_c(stack_k.k));
+		if (r && r->need_restripe)
+			bch_info_ratelimited(c,
+				"reconcile: restriping extent %llu:%llu",
+				stack_k.k->k.p.inode,
+				stack_k.k->k.p.offset);
+	}
+
 	event_add_trace(c, reconcile_data, stack_k.k->k.size, buf, ({
 		prt_newline(&buf);
 		bch2_bkey_val_to_text(&buf, c, bkey_i_to_s_c(stack_k.k));
