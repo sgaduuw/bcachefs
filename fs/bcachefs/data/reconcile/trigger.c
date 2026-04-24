@@ -583,6 +583,7 @@ static int bch2_bkey_needs_reconcile(struct btree_trans *trans, struct bkey_s_c 
 	 * since an extent could have replicas in different stripes.
 	 */
 	if (ec && !unwritten && !(r.need_rb & BIT(BCH_RECONCILE_erasure_code))) {
+		/* Short-circuit: once flagged, the whole extent is rewritten */
 		for (unsigned i = 0; i < nr_ec_stripes && !r.need_restripe; i++) {
 			CLASS(btree_iter, s_iter)(trans, BTREE_ID_stripes,
 						 POS(0, ec_stripe_idxs[i]), 0);
