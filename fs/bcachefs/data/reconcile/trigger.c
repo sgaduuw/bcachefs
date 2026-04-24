@@ -690,7 +690,8 @@ static int new_needs_rb_allowed(struct btree_trans *trans,
 
 	if (ctx == SET_NEEDS_RECONCILE_foreground) {
 		new_need_rb &= ~(BIT(BCH_RECONCILE_background_compression)|
-				 BIT(BCH_RECONCILE_background_target));
+				 BIT(BCH_RECONCILE_background_target)|
+				 BIT(BCH_RECONCILE_stripe_width));
 
 		/*
 		 * Foreground writes might end up degraded when a device is

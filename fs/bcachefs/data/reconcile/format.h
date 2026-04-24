@@ -156,6 +156,8 @@ enum bch_reconcile_opts {
 #define x(n)	BCH_RECONCILE_##n,
 	BCH_RECONCILE_OPTS()
 #undef x
+	/* Not an inode opt; standalone need_rb flag for narrow EC stripes */
+	BCH_RECONCILE_stripe_width,
 };
 
 #define BCH_RECONCILE_ACCOUNTING()		\

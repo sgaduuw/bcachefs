@@ -51,6 +51,7 @@ enum reconcile_phase_type {
 
 const char * const bch2_reconcile_opts[] = {
 	BCH_RECONCILE_OPTS()
+	[BCH_RECONCILE_stripe_width] = "stripe_width",
 	NULL
 };
 
@@ -412,6 +413,20 @@ static int reconcile_set_data_opts(struct btree_trans *trans,
 
 				ptr_bit <<= 1;
 			}
+		}
+	}
+
+	if (r->need_rb & BIT(BCH_RECONCILE_stripe_width)) {
+		/*
+		 * Extent lives in a narrow EC stripe; drop the EC encoding
+		 * so data gets rewritten to new buckets and re-encoded into
+		 * a (hopefully wider) stripe by the normal EC background path.
+		 */
+		unsigned ptr_bit = 1;
+		bkey_for_each_ptr_decode(k.k, ptrs, p, entry) {
+			if (p.has_ec)
+				data_opts->ptrs_kill_ec |= ptr_bit;
+			ptr_bit <<= 1;
 		}
 	}
 
