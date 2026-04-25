@@ -8,7 +8,9 @@
 
 struct bch_fs_reconcile {
 	struct task_struct __rcu	*thread;
+	struct task_struct __rcu	*normal_thread;
 	u32				kick;
+	bool				hipri_active;
 
 	bool				running;
 	u64				wait_iotime_start;
@@ -19,6 +21,9 @@ struct bch_fs_reconcile {
 	struct bbpos			work_pos;
 	struct bch_move_stats		work_stats;
 	struct progress_indicator	progress;
+
+	struct bch_move_stats		normal_work_stats;
+	atomic64_t			normal_sectors_total;
 
 	struct bbpos			scan_start;
 	struct bbpos			scan_end;

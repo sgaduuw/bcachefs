@@ -1244,7 +1244,22 @@ static void reconcile_phase_start(struct bch_fs *c)
 {
 	struct bch_fs_reconcile *r = &c->reconcile;
 	struct reconcile_phase p = reconcile_phases[r->phase];
+	bool was_hipri = r->hipri_active;
+
 	r->work_pos = BBPOS(p.btree, p.start);
+	r->hipri_active = (p.priority == RECONCILE_WORK_hipri &&
+			   p.type != RECONCILE_PHASE_scan);
+
+	/*
+	 * Wake the normal helper thread when entering hipri, or let it
+	 * notice hipri_active == false on its next loop iteration:
+	 */
+	if (r->hipri_active && !was_hipri) {
+		guard(rcu)();
+		struct task_struct *t = rcu_dereference(r->normal_thread);
+		if (t)
+			wake_up_process(t);
+	}
 
 	switch (p.type) {
 	case RECONCILE_PHASE_normal:
@@ -1443,6 +1458,95 @@ static int do_reconcile(struct moving_context *ctxt)
 	return ret;
 }
 
+/*
+ * Helper thread: processes normal-priority logical extent work
+ * (BTREE_ID_reconcile_work) while the main reconcile thread is busy
+ * with hipri phases. This prevents restripe and other normal work
+ * from being completely starved during long hipri passes.
+ *
+ * Sleeps when the main thread is not in a hipri phase.
+ */
+static int bch2_reconcile_normal_thread(void *arg)
+{
+	struct bch_fs *c = arg;
+	struct bch_fs_reconcile *r = &c->reconcile;
+
+	set_freezable();
+
+	kthread_wait_freezable(c->recovery.pass_done > BCH_RECOVERY_PASS_check_snapshots ||
+			       kthread_should_stop());
+	if (kthread_should_stop())
+		return 0;
+
+	struct moving_context ctxt __cleanup(bch2_moving_ctxt_exit);
+	bch2_moving_ctxt_init(&ctxt, c, NULL, &r->normal_work_stats,
+			      writepoint_ptr(&c->allocator.reconcile_write_point),
+			      true);
+
+	struct btree_trans *trans = ctxt.trans;
+	CLASS(per_snapshot_io_opts, snapshot_io_opts)(c);
+	CLASS(darray_stripe_retry, stripe_retry)();
+
+	while (!kthread_should_stop()) {
+		kthread_wait_freezable(r->hipri_active ||
+				       kthread_should_stop());
+		if (kthread_should_stop())
+			break;
+
+		bch2_move_stats_init(&r->normal_work_stats, "reconcile_normal");
+
+		struct bpos pos = POS_MIN;
+
+		while (r->hipri_active &&
+		       !bch2_move_ratelimit(&ctxt) &&
+		       !test_bit(BCH_FS_going_ro, &c->flags) &&
+		       !kthread_should_stop()) {
+
+			bch2_trans_begin(trans);
+
+			CLASS(btree_iter, iter)(trans, BTREE_ID_reconcile_work,
+					       pos, BTREE_ITER_all_snapshots);
+			struct bkey_s_c k = bch2_btree_iter_peek(&iter);
+			int ret = bkey_err(k);
+
+			if (bch2_err_matches(ret, BCH_ERR_transaction_restart))
+				continue;
+			if (ret)
+				break;
+			if (!k.k)
+				break;
+
+			struct bpos k_pos = k.k->p;
+			r->normal_work_stats.pos = BBPOS(BTREE_ID_reconcile_work, k_pos);
+
+			if (k.k->type == KEY_TYPE_set) {
+				ret = lockrestart_do(trans,
+					do_reconcile_extent(&ctxt, &snapshot_io_opts,
+						BBPOS(BTREE_ID_reconcile_work, k_pos),
+						&stripe_retry));
+
+				if (bch2_err_matches(ret, BCH_ERR_transaction_restart))
+					continue;
+				if (ret)
+					break;
+
+				do_retry_stripes(&ctxt, &stripe_retry);
+			}
+
+			pos = btree_type_has_snapshot_field(BTREE_ID_reconcile_work)
+				? bpos_successor(k_pos)
+				: bpos_nosnap_successor(k_pos);
+		}
+
+		bch2_moving_ctxt_flush_all(&ctxt);
+		atomic64_add(atomic64_read(&r->normal_work_stats.sectors_moved),
+			     &r->normal_sectors_total);
+		bch2_move_stats_exit(&r->normal_work_stats, c);
+	}
+
+	return 0;
+}
+
 static int bch2_reconcile_thread(void *arg)
 {
 	struct bch_fs *c = arg;
@@ -1524,6 +1628,22 @@ void bch2_reconcile_status_to_text(struct printbuf *out, struct bch_fs *c)
 		}
 	}
 
+	if (r->hipri_active) {
+		u64 moved = atomic64_read(&r->normal_work_stats.sectors_moved) +
+			    atomic64_read(&r->normal_sectors_total);
+		struct bbpos npos = r->normal_work_stats.pos;
+		barrier();
+
+		prt_printf(out, "normal helper:\tactive, pos ");
+		bch2_bbpos_to_text(out, npos);
+		if (moved) {
+			prt_str(out, ", ");
+			bch2_prt_human_readable_s64(out, moved << 9);
+			prt_str(out, " moved");
+		}
+		prt_newline(out);
+	}
+
 	struct task_struct *t;
 	scoped_guard(rcu) {
 		t = rcu_dereference(c->reconcile.thread);
@@ -1565,13 +1685,21 @@ void bch2_reconcile_stop(struct bch_fs *c)
 {
 	struct task_struct *p;
 
+	c->reconcile.hipri_active = false;
+
+	p = rcu_dereference_protected(c->reconcile.normal_thread, 1);
+	c->reconcile.normal_thread = NULL;
+	if (p) {
+		synchronize_rcu();
+		kthread_stop(p);
+		put_task_struct(p);
+	}
+
 	p = rcu_dereference_protected(c->reconcile.thread, 1);
 	c->reconcile.thread = NULL;
-
 	if (p) {
-		/* for sychronizing with bch2_reconcile_wakeup() */
+		/* for synchronizing with bch2_reconcile_wakeup() */
 		synchronize_rcu();
-
 		kthread_stop(p);
 		put_task_struct(p);
 	}
@@ -1594,6 +1722,17 @@ int bch2_reconcile_start(struct bch_fs *c)
 
 	get_task_struct(p);
 	rcu_assign_pointer(c->reconcile.thread, p);
+	wake_up_process(p);
+
+	p = kthread_create(bch2_reconcile_normal_thread, c,
+			   "bch-reconcile-normal/%s", c->name);
+	ret = PTR_ERR_OR_ZERO(p);
+	bch_err_msg(c, ret, "creating reconcile normal helper thread");
+	if (ret)
+		return ret;
+
+	get_task_struct(p);
+	rcu_assign_pointer(c->reconcile.normal_thread, p);
 	wake_up_process(p);
 	return 0;
 }
