@@ -17,6 +17,8 @@ struct bch_fs_reconcile {
 
 	unsigned			phase;
 	struct bbpos			work_pos;
+	struct bbpos			normal_work_pos;
+	unsigned			interleave_count;
 	struct bch_move_stats		work_stats;
 	struct progress_indicator	progress;
 

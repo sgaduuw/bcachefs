@@ -1307,6 +1307,8 @@ static int do_reconcile(struct moving_context *ctxt)
 	CLASS(per_snapshot_io_opts, snapshot_io_opts)(c);
 
 	r->phase = 0;
+	r->normal_work_pos = BBPOS(BTREE_ID_reconcile_work, POS_MIN);
+	r->interleave_count = 0;
 	reconcile_phase_start(c);
 
 	struct bkey_i_cookie pending_cookie;
@@ -1334,6 +1336,8 @@ static int do_reconcile(struct moving_context *ctxt)
 			kick		= r->kick;
 			work.nr		= 0;
 			r->phase	= 0;
+			r->normal_work_pos = BBPOS(BTREE_ID_reconcile_work, POS_MIN);
+			r->interleave_count = 0;
 			reconcile_phase_start(c);
 		}
 
@@ -1420,6 +1424,46 @@ static int do_reconcile(struct moving_context *ctxt)
 		r->work_pos.pos = btree_type_has_snapshot_field(r->work_pos.btree)
 			? bpos_successor(r->work_pos.pos)
 			: bpos_nosnap_successor(r->work_pos.pos);
+
+		/*
+		 * Interleave: process one normal-priority extent every 10
+		 * hipri entries. This prevents restripe and other normal
+		 * work from being completely starved while a long hipri
+		 * extent phase drains.
+		 *
+		 * Only during hipri logical extent phases (not phys, which
+		 * spawns per-device closure threads that can't be mixed).
+		 */
+		if (reconcile_phases[r->phase].priority == RECONCILE_WORK_hipri &&
+		    reconcile_phases[r->phase].type == RECONCILE_PHASE_normal &&
+		    !bpos_eq(r->normal_work_pos.pos, SPOS_MAX) &&
+		    ++r->interleave_count >= 10) {
+			r->interleave_count = 0;
+
+			struct bkey_s_c nk;
+			CLASS(btree_iter, nw_iter)(trans, BTREE_ID_reconcile_work,
+						   r->normal_work_pos.pos,
+						   BTREE_ITER_all_snapshots);
+			int nret = lockrestart_do(trans,
+				bkey_err(nk = bch2_btree_iter_peek(&nw_iter)));
+
+			if (!nret && nk.k) {
+				struct bpos nk_pos = nk.k->p;
+
+				if (nk.k->type == KEY_TYPE_set)
+					lockrestart_do(trans,
+						do_reconcile_extent(ctxt, &snapshot_io_opts,
+							BBPOS(BTREE_ID_reconcile_work, nk_pos),
+							&stripe_retry));
+
+				r->normal_work_pos.pos =
+					btree_type_has_snapshot_field(BTREE_ID_reconcile_work)
+					? bpos_successor(nk_pos)
+					: bpos_nosnap_successor(nk_pos);
+			} else if (!nret) {
+				r->normal_work_pos.pos = SPOS_MAX;
+			}
+		}
 	}
 
 	if (!ret && !bkey_deleted(&pending_cookie.k))
