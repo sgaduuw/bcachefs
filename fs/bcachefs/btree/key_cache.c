@@ -578,6 +578,13 @@ int bch2_btree_key_cache_journal_flush(struct journal *j,
 	if (READ_ONCE(ck->journal.seq) == seq &&
 	    test_bit(BKEY_CACHED_DIRTY, &ck->flags)) {
 		CLASS(btree_trans, trans)(c);
+		/*
+		 * Journal reclaim invokes this callback to drop a pin held
+		 * by a dirty cached key. Reclaim cannot make progress until
+		 * the flush succeeds, so don't lose intent-lock contention
+		 * to ordinary background workers on the same key.
+		 */
+		trans->locking_wait.priority = 1;
 
 		ret = lockrestart_do(trans, ({
 			btree_path_idx_t path_idx;
@@ -645,6 +652,13 @@ int bch2_btree_key_cache_flush_going_ro(struct bch_fs *c)
 
 	guard(srcu)(&c->btree.trans.barrier);
 	CLASS(btree_trans, trans)(c);
+	/*
+	 * Same rationale as the WB going-ro flush: __bch2_fs_read_only's
+	 * clean_passes loop only converges if every dirty cached key drains.
+	 * Don't lose intent-lock contention to background work that has not
+	 * yet been stopped.
+	 */
+	trans->locking_wait.priority = 1;
 	CLASS(bkey_cached_keys, keys)();
 	bool any_done = false, full;
 
