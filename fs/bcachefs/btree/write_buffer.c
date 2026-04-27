@@ -908,6 +908,7 @@ static int bch2_btree_write_buffer_journal_flush(struct journal *j,
 	struct btree_write_buffer_keys *keys =
 		container_of(_pin, struct btree_write_buffer_keys, pin);
 	CLASS(btree_trans, trans)(c);
+	trans->locking_wait.priority = 1;
 
 	return btree_write_buffer_flush_seq_one(trans, keys->wb_btree, seq,
 						WB_FLUSH_journal_pin);
@@ -934,6 +935,7 @@ bool bch2_btree_write_buffer_flush_going_ro(struct bch_fs *c)
 		return false;
 
 	CLASS(btree_trans, trans)(c);
+	trans->locking_wait.priority = 1;
 	bool did_work = false;
 	btree_write_buffer_flush_seq(trans, journal_cur_seq(&c->journal), &did_work,
 				     WB_FLUSH_sync);
@@ -1049,6 +1051,13 @@ static void bch2_btree_write_buffer_flush_work_fn(struct work_struct *work)
 	scoped_guard(memalloc_flags, PF_MEMALLOC_NOFS) {
 		guard(mutex)(&wb->flushing.lock);
 		CLASS(btree_trans, trans)(c);
+		/*
+		 * WB flush must win btree lock contention against
+		 * background workers: journal reclaim depends on WB
+		 * flush making progress, and a thundering herd of
+		 * reconcile/move workers can starve it.
+		 */
+		trans->locking_wait.priority = 1;
 		do {
 			bch2_trans_unlock_long(trans);
 			bch2_btree_write_buffer_flush_locked(trans, wb->idx, WB_FLUSH_thread);
