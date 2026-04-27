@@ -313,11 +313,12 @@ again:
 	} else {
 		/*
 		 * Intent/write locks have a single holder: prefer the waiter
-		 * whose transaction started earliest. start_time is cached in
-		 * the slot so the scan doesn't deref each waiter.
+		 * with the highest priority, breaking ties by oldest
+		 * transaction start time. Default priority 0 preserves the
+		 * existing oldest-first ordering.
 		 */
-		struct six_lock_wait_slot *oldest = NULL;
-		u16 oldest_iter = 0;
+		struct six_lock_wait_slot *best = NULL;
+		u16 best_iter = 0;
 		unsigned n_matches = 0;
 
 		for (u16 i = 0; i < wf->nr; i++) {
@@ -326,21 +327,23 @@ again:
 			    (slot->start_time & SIX_LOCK_WANT_MASK) != lock_type)
 				continue;
 			n_matches++;
-			if (!oldest ||
-			    time_before64(slot->start_time, oldest->start_time)) {
-				oldest = slot;
-				oldest_iter = i;
+			if (!best ||
+			    slot->w->priority > best->w->priority ||
+			    (slot->w->priority == best->w->priority &&
+			     time_before64(slot->start_time, best->start_time))) {
+				best = slot;
+				best_iter = i;
 			}
 		}
 
-		if (oldest) {
-			ret = __do_six_trylock(lock, lock_type, oldest->w->task, false);
+		if (best) {
+			ret = __do_six_trylock(lock, lock_type, best->w->task, false);
 			if (ret <= 0)
 				goto unlock;
 
-			struct six_lock_waiter *w = oldest->w;
+			struct six_lock_waiter *w = best->w;
 			task = get_task_struct(w->task);
-			six_lock_wait_fifo_remove(wf, oldest_iter);
+			six_lock_wait_fifo_remove(wf, best_iter);
 			smp_store_release(&w->lock_acquired, true);
 			wake_up_process(task);
 			put_task_struct(task);
